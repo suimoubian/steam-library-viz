@@ -767,7 +767,7 @@ select.form-select:focus{border-color:var(--cyan);box-shadow:0 0 0 .12rem rgba(9
 
   <div class="foot">
     数据来源：Steam Web API 官方接口（真实采集，非模拟数据）　·　
-    样本 <b id="fPlayers">—</b> 位参与者 / <b id="fGames">—</b> 款游戏 / <b id="fRecs">—</b> 条库记录 <b id="svSrcNote" style="color:#F5C542"></b><span id="svBuild" style="opacity:.5;font-size:11px"> 构建 2026-10-23 10:45</span>　·　
+    样本 <b id="fPlayers">—</b> 位参与者 / <b id="fGames">—</b> 款游戏 / <b id="fRecs">—</b> 条库记录 <b id="svSrcNote" style="color:#F5C542"></b><span id="svBuild" style="opacity:.5;font-size:11px"> 构建 2026-10-24 16:02</span>　·　
     封面图：Steam 官方 CDN（已内嵌，离线可用）<br>
     所有参与者昵称均已脱敏为「参与者N」，不展示任何个人信息　·　
     指标 RAI 烂尾指数 · HV 心碎值　·　生成时间 <span id="genTime"></span>
@@ -795,7 +795,7 @@ select.form-select:focus{border-color:var(--cyan);box-shadow:0 0 0 .12rem rgba(9
   </div>
 </div>
 
-<script>console.log("%cBACKLOG 构建 2026-10-23 10:45","color:#5EC8F5");</script>
+<script>console.log("%cBACKLOG 构建 2026-10-24 16:02","color:#5EC8F5");</script>
 <script>
 /* ============================================================
    指标计算引擎（浏览器端）
@@ -5791,6 +5791,365 @@ function SVLoadAccount(sid){
    ⚠ 只定义不调用的话它永远不会出现 —— 第一版就是漏了这一步。 */
 setTimeout(function(){ try{ SVRefreshAcctSelect(); }catch(e){} }, 900);
 setTimeout(function(){ try{ SVRefreshAcctSelect(); }catch(e){} }, 3600);
+
+(function (global) {
+  'use strict';
+
+  var PROXY_LS = 'sv_online_proxy_v1';
+  /* 部署 Cloudflare Worker 后，把地址填到这里（也可以由用户在界面上填） */
+  var DEFAULT_PROXY = '';
+
+  var state = { running: false, aborter: null, done: 0, total: 0, okDetail: 0, okTag: 0 };
+
+  function proxyUrl() {
+    var v = '';
+    try { v = localStorage.getItem(PROXY_LS) || ''; } catch (e) {}
+    if (v) return v.replace(/\/+$/, '');
+    if (DEFAULT_PROXY) return DEFAULT_PROXY.replace(/\/+$/, '');
+    /* 本地联调：页面本身跑在 127.0.0.1 时就猜本地代理 */
+    if (/^(127\.0\.0\.1|localhost)$/.test(location.hostname)) return 'http://127.0.0.1:8890';
+    return '';
+  }
+
+  function setProxy(v) {
+    try { localStorage.setItem(PROXY_LS, String(v || '').trim()); } catch (e) {}
+  }
+
+  /* 本机后端在不在？—— 决定「立即获取」还是「在线获取」 */
+  function probeLocal(cb) {
+    var done = false;
+    function fin(ok) { if (!done) { done = true; cb(ok); } }
+    var t = setTimeout(function () { fin(false); }, 1500);
+    try {
+      fetch('/api/fetch/status', { headers: { 'X-Requested-With': 'SVDashboard' } })
+        .then(function (r) { clearTimeout(t); fin(r.ok); })
+        .catch(function () { clearTimeout(t); fin(false); });
+    } catch (e) { clearTimeout(t); fin(false); }
+  }
+
+  function jget(url, ms, tries) {
+    var n = tries == null ? 2 : tries;
+    function once(i) {
+      var opt = {};
+      if (state.aborter) opt.signal = state.aborter.signal;
+      return fetch(url, opt).then(function (r) {
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        return r.json();
+      }).catch(function (e) {
+        /* 5xx / 网络抖动再试一次 —— Steam 的连接偶发超时，
+           代理重试仍失败时这一层还能兜住一次。4xx 不重试。 */
+        var msg = String(e && e.message || e);
+        var retryable = /HTTP 5\d\d/.test(msg) || /Failed to fetch|NetworkError|aborted/i.test(msg);
+        if (i < n - 1 && retryable && !(state.aborter && state.aborter.signal.aborted)) {
+          return new Promise(function (res) { setTimeout(res, 400); }).then(function () { return once(i + 1); });
+        }
+        throw e;
+      });
+    }
+    return once(0);
+  }
+
+  /* 把用户输入解析成 17 位 SteamID64 */
+  function resolveTarget(raw, key) {
+    var s = String(raw || '').trim();
+    if (!s) return Promise.reject(new Error('请先填 SteamID 或主页链接'));
+    var m = s.match(/(\d{17})/);
+    if (m) return Promise.resolve(m[1]);
+    var mv = s.match(/\/id\/([A-Za-z0-9_\-\.]+)/);
+    if (mv) {
+      var px = proxyUrl();
+      if (!px) return Promise.reject(new Error('解析自定义 ID 需要代理地址'));
+      if (!key) return Promise.reject(new Error('解析自定义 ID 需要 API Key'));
+      return jget(px + '/resolve?key=' + encodeURIComponent(key) +
+                  '&vanity=' + encodeURIComponent(mv[1]))
+        .then(function (j) {
+          var r = (j && j.response) || {};
+          if (r.success === 1 && r.steamid) return r.steamid;
+          throw new Error('找不到这个自定义 ID');
+        });
+    }
+    if (/^\d{17}$/.test(s)) return Promise.resolve(s);
+    return Promise.reject(new Error('认不出这个 ID（要 17 位 SteamID64 或主页链接）'));
+  }
+
+  /* ── 并发池：同时跑 n 个，每个之间留一点间隔，避免被 Steam 限流 ── */
+  function pool(items, n, gapMs, worker, onStep) {
+    var i = 0, active = 0, finished = 0;
+    return new Promise(function (resolve) {
+      function next() {
+        if (state.aborter && state.aborter.signal.aborted) return;
+        if (finished >= items.length) return resolve();
+        while (active < n && i < items.length) {
+          (function (idx) {
+            active++;
+            var item = items[idx];
+            worker(item, idx)
+              .catch(function () { /* 单款失败不影响整体 */ })
+              .then(function () {
+                active--; finished++;
+                if (onStep) onStep(finished, items.length);
+                if (finished >= items.length) resolve();
+                else setTimeout(next, gapMs);
+              });
+          })(i++);
+        }
+      }
+      next();
+    });
+  }
+
+  function setProgress(pct, text) {
+    var bar = document.getElementById('svOnProg');
+    var st = document.getElementById('svOnState');
+    if (bar) bar.style.width = Math.max(0, Math.min(100, pct)) + '%';
+    if (st) st.textContent = text || '';
+  }
+
+  /* ── 主流程 ── */
+  function start() {
+    if (state.running) return;
+    var keyEl = document.getElementById('svKeyInput');
+    var tgtEl = document.getElementById('svTargetInput');
+    var key = keyEl ? String(keyEl.value || '').trim() : '';
+    var raw = tgtEl ? String(tgtEl.value || '').trim() : '';
+
+    /* Key 可能已经在本地存过（这里没有本地后端，读不到）—— 必须当场填 */
+    if (!key) {
+      alert('在线抓取需要填 API Key：请在「更换 API Key」里把 32 位 Key 粘进来。');
+      return;
+    }
+    if (key.length !== 32) {
+      alert('API Key 应该是 32 位，现在填了 ' + key.length + ' 位。');
+      return;
+    }
+    var px = proxyUrl();
+    if (!px) {
+      alert('还没有设置代理地址。\n\n在线抓取必须经过一个代理（Steam 不给浏览器跨域权限）。\n' +
+            '请点「代理设置」填入你的 Cloudflare Worker 地址，例如：\n' +
+            'https://steam-proxy.你的用户名.workers.dev');
+      return;
+    }
+
+    state.running = true;
+    state.done = 0; state.total = 0; state.okDetail = 0; state.okTag = 0;
+    state.aborter = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+    var t0 = Date.now();
+    var BUDGET = 150000;   /* 补全阶段的时限：到点就用已拿到的继续 */
+
+    var btn = document.getElementById('svOnlineGo');
+    var stop = document.getElementById('svOnlineStop');
+    if (btn) { btn.disabled = true; btn.textContent = '抓取中…'; }
+    if (stop) stop.style.display = '';
+
+    setProgress(3, '正在解析 SteamID…');
+
+    resolveTarget(raw, key)
+      .then(function (sid) {
+        setProgress(10, '正在读取游戏库（账号 ' + sid + '）…');
+        return jget(px + '/owned?key=' + encodeURIComponent(key) +
+                    '&steamid=' + encodeURIComponent(sid)).then(function (j) {
+          if (j && j.ok === false) {
+            throw new Error(j.hint || j.reason || '接口返回失败');
+          }
+          var resp = (j && j.response) || {};
+          var games = resp.games || [];
+          if (!games.length) {
+            throw new Error('读到 0 款游戏。多半是对方的「游戏详情」没有设为公开；\n' +
+                            '也可能是这个账号确实没有游戏。');
+          }
+          return { sid: sid, games: games };
+        });
+      })
+      .then(function (r) {
+        var sid = r.sid, games = r.games;
+        var out = games.map(function (g) {
+          return {
+            appid: g.appid,
+            name: g.name || ('App ' + g.appid),
+            playtime_forever: g.playtime_forever || 0,
+            rtime_last_played: g.rtime_last_played || 0,
+            genres: [],
+            tags: [],
+            price_initial: null
+          };
+        });
+        var byId = {};
+        out.forEach(function (o) { byId[o.appid] = o; });
+        state.games = out;          /* finish() 里要用，必须挂到 state 上 */
+
+        var ids = out.map(function (o) { return o.appid; });
+        state.total = ids.length;
+        setProgress(15, '读到 ' + ids.length + ' 款，正在补全类型/价格/标签（可随时停止）…');
+
+        return pool(ids, 4, 220, function (appid) {
+          if (Date.now() - t0 > BUDGET) return Promise.resolve();
+          var rec = byId[appid];
+          return jget(px + '/appdetails?appid=' + appid)
+            .then(function (d) {
+              var k = String(appid);
+              var v = d && d[k];
+              if (v && v.success && v.data) {
+                var dat = v.data;
+                rec.genres = (dat.genres || []).map(function (x) { return x.description; });
+                rec.name = dat.name || rec.name;
+                var po = dat.price_overview || {};
+                if (po.initial != null) { rec.price_initial = po.initial; rec.priceUnit = 'fen'; }
+                else if (dat.is_free) { rec.price_initial = 0; rec.priceUnit = 'fen'; }
+                state.okDetail++;
+              }
+              /* 标签从商店页取（官方接口不给），每款多一次请求 */
+              if (Date.now() - t0 > BUDGET) return;
+              return jget(px + '/tags?appid=' + appid)
+                .then(function (tg) {
+                  if (tg && tg.tags && tg.tags.length) {
+                    rec.tags = tg.tags;
+                    state.okTag++;
+                  }
+                })
+                .catch(function () {});
+            });
+        }, function (d, n) {
+          var pct = 15 + (d / n) * 80;
+          setProgress(pct, '补全 ' + d + '/' + n + '　类型 ' + state.okDetail +
+                          ' · 标签 ' + state.okTag +
+                          '　已用 ' + Math.round((Date.now() - t0) / 1000) + 's');
+        });
+      })
+      .then(function () {
+        return finish(null);
+      })
+      .catch(function (e) {
+        return finish(e);
+      });
+
+    function finish(err) {
+      state.running = false;
+      if (btn) { btn.disabled = false; btn.textContent = '在线获取'; }
+      if (stop) stop.style.display = 'none';
+      if (err) {
+        setProgress(0, '');
+        if (String(err.name) === 'AbortError') { setProgress(0, '已停止。'); return; }
+        alert('在线抓取失败：' + (e_msg(err)));
+        return;
+      }
+      /* 把结果交给现有的解析/计算/落盘链路 —— 和「导入文件」完全同一条路 */
+      var box = document.getElementById('svOnResult');
+      if (box) {
+        box.style.display = '';
+        box.textContent = '已抓取：' + state.total + ' 款（类型 ' + state.okDetail +
+                          ' · 标签 ' + state.okTag + '）。正在交给页面计算…';
+      }
+      setProgress(100, '完成：' + state.total + ' 款');
+      try {
+        var payload = { games: state.games || [] };
+        var parsed = global.SVMetrics.parse(payload);
+        var data = global.SVMetrics.compute(parsed, {
+          source: 'Steam 在线抓取（' + state.total + ' 款）'
+        });
+        /* ⚠ 不要自己写 SV_MODE / RAW —— 那两个是 SWITCHER 里的 `let` 绑定，
+           从别的闭包给 window.SV_MODE 赋值是**另一个变量**，页面不会变。
+           正确做法：先落盘，再交给现成的 SVSwitch('user') 去加载并重绘。 */
+        Promise.resolve(global.SVImport.saveUser(data)).then(function () {
+          if (global.SVSwitch) {
+            global.SVSwitch('user');
+          } else if (global.SVToast) {
+            SVToast('数据已保存，请点「我的数据」查看', 'ok');
+          }
+        });
+      } catch (e) {
+        alert('数据已抓到，但计算时出错：' + e.message);
+      }
+    }
+
+    function e_msg(e) { return (e && (e.message || e)) || '未知错误'; }
+  }
+
+  function stopIt() {
+    if (state.aborter) { try { state.aborter.abort(); } catch (e) {} }
+    state.running = false;
+    var btn = document.getElementById('svOnlineGo');
+    var stop = document.getElementById('svOnlineStop');
+    if (btn) { btn.disabled = false; btn.textContent = '在线获取'; }
+    if (stop) stop.style.display = 'none';
+    setProgress(0, '已停止（已抓到的部分不会保存）。');
+  }
+
+  /* ── 界面：把「在线获取」按钮与代理设置插到「立即获取」旁边 ── */
+  function buildUi() {
+    var go = document.getElementById('svFetchGo');
+    if (!go || document.getElementById('svOnlineGo')) return;
+    var wrap = document.createElement('span');
+    wrap.style.cssText = 'display:inline-block;margin-left:8px';
+    wrap.innerHTML =
+      '<button class="sv-btn" id="svOnlineGo" style="display:none">在线获取</button>' +
+      '<button class="sv-btn ghost" id="svOnlineStop" style="display:none;margin-left:6px">停止</button>' +
+      '<button class="sv-btn ghost" id="svOnlineCfg" style="display:none;margin-left:6px">代理设置</button>';
+    go.parentNode.insertBefore(wrap, go.nextSibling);
+
+    var prog = document.createElement('div');
+    prog.id = 'svOnlineBox';
+    prog.style.cssText = 'display:none;margin-top:10px';
+    prog.innerHTML =
+      '<div style="height:6px;background:#1B2836;border-radius:3px;overflow:hidden">' +
+        '<i id="svOnProg" style="display:block;height:100%;width:0;background:#3DD68C;' +
+        'transition:width .25s"></i></div>' +
+      '<div id="svOnState" style="color:#8FA6B8;font-size:12px;margin-top:6px"></div>' +
+      '<div id="svOnResult" style="display:none;color:#3DD68C;font-size:12px;margin-top:6px"></div>' +
+      '<div id="svOnCfgRow" style="display:none;margin-top:8px">' +
+        '<div style="color:#8FA6B8;font-size:12px;margin-bottom:4px">代理地址（Cloudflare Worker）</div>' +
+        '<input id="svOnProxy" type="text" placeholder="https://steam-proxy.xxx.workers.dev" ' +
+        'style="width:100%;padding:7px 9px;border-radius:4px;border:1px solid #2A3A48;' +
+        'background:#0E1621;color:#E8EFF5;font-size:12.5px">' +
+        '<div style="color:#7B92A6;font-size:11.5px;margin-top:5px">' +
+        '不需要填 API Key 也能保存代理地址。仅保存在本机浏览器。</div>' +
+      '</div>';
+    go.parentNode.parentNode.insertBefore(prog, go.parentNode.nextSibling);
+
+    document.getElementById('svOnlineCfg').onclick = function () {
+      var row = document.getElementById('svOnCfgRow');
+      row.style.display = row.style.display === 'none' ? '' : 'none';
+      var ip = document.getElementById('svOnProxy');
+      if (ip && !ip.value) ip.value = proxyUrl() || '';
+    };
+    document.getElementById('svOnlineGo').onclick = start;
+    document.getElementById('svOnlineStop').onclick = stopIt;
+    var ip = document.getElementById('svOnProxy');
+    if (ip) {
+      ip.value = proxyUrl() || '';
+      ip.onchange = function () { setProxy(this.value); };
+    }
+
+    /* 本机后端不在 → 显示「在线获取」 */
+    probeLocal(function (hasLocal) {
+      var on = document.getElementById('svOnlineGo');
+      var cfg = document.getElementById('svOnlineCfg');
+      if (!hasLocal) {
+        if (on) on.style.display = '';
+        if (cfg) cfg.style.display = '';
+        var box = document.getElementById('svOnlineBox');
+        if (box) box.style.display = '';
+        var st = document.getElementById('svOnState');
+        if (st) {
+          st.innerHTML = '当前是<b>线上静态版</b>（没有本机后端）。' +
+            '可以在这里直接输入 API Key + SteamID 在线抓取 —— 需要先设置代理地址。';
+        }
+        var g = document.getElementById('svFetchGo');
+        if (g) { g.disabled = true; g.title = '线上版没有本机后端，请用「在线获取」'; }
+      }
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', function () { setTimeout(buildUi, 1200); });
+  } else {
+    setTimeout(buildUi, 1200);
+  }
+
+  global.SVOnline = {
+    start: start, stop: stopIt, proxyUrl: proxyUrl, setProxy: setProxy,
+    probeLocal: probeLocal, _state: state
+  };
+})(window);
 
 /* ---------- 初始化 ---------- */
 const Q = new URLSearchParams(location.search);
