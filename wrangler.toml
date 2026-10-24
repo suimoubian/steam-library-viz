@@ -1,25 +1,26 @@
-// Cloudflare Worker 部署配置
-//
-// 为什么需要这个文件：
-//   Worker「steam-library-viz」是**连接 Git 仓库**的（suimoubian/steam-library-viz），
-//   每次往仓库 push，Cloudflare 都会自动跑一次 `npx wrangler deploy`。
-//   没有这个文件时，wrangler 会把仓库当成**静态站点**部署 ——
-//   于是我们手动粘进去的代理代码会被覆盖掉（2026-10-24 实际踩到：
-//   上传 index.html 后 /ping 变成 404，/ 变成了演示页面）。
-//
-//   有了它，每次自动部署都会用仓库里的 worker.js 当 Worker 入口，
-//   代理代码就再也不会被冲掉了。
-//
-// 注意：本文件的 name 必须和 Cloudflare 上的 Worker 名字一致。
+# Cloudflare Worker 部署配置
+#
+# 为什么需要这个文件：
+#   Worker「steam-library-viz」是**连接 Git 仓库**的（suimoubian/steam-library-viz），
+#   每次往仓库 push，Cloudflare 都会自动跑一次 `npx wrangler deploy`。
+#   没有这个文件时，wrangler 会把仓库当成**静态站点**部署 ——
+#   于是手动粘进 Cloudflare 的代理代码会被覆盖掉
+#   （2026-10-24 实际踩到：上传 index.html 后 /ping 变成 404，/ 变成了演示页面）。
+#
+#   有了它，每次自动部署都会用仓库里的 worker.js 当 Worker 入口，
+#   代理代码就再也不会被冲掉了。
+#
+# 注意：name 必须和 Cloudflare 上的 Worker 名字一致。
+# 注意：TOML 的注释是 `#`，不是 `//` —— 第一次写成 `//` 导致构建失败。
 
 name = "steam-library-viz"
 main = "worker.js"
 compatibility_date = "2026-10-24"
 
-# 允许通过 *.workers.dev 访问（默认就是开的，写出来更明确）
+# 允许通过 *.workers.dev 访问
 workers_dev = true
 
-# ⚠ 不要加 [assets] / assets = ... ——
-#   那会把仓库当静态站点发布，正是要避免的行为。
-#   静态站点走的是 GitHub Pages（https://suimoubian.github.io/steam-library-viz/），
-#   和这个 Worker 互不相干。
+# 不要加 assets 配置 ——
+# 那会把仓库当静态站点发布，正是要避免的行为。
+# 静态站点走的是 GitHub Pages（https://suimoubian.github.io/steam-library-viz/），
+# 和这个 Worker 互不相干。
