@@ -767,7 +767,7 @@ select.form-select:focus{border-color:var(--cyan);box-shadow:0 0 0 .12rem rgba(9
 
   <div class="foot">
     数据来源：Steam Web API 官方接口（真实采集，非模拟数据）　·　
-    样本 <b id="fPlayers">—</b> 位参与者 / <b id="fGames">—</b> 款游戏 / <b id="fRecs">—</b> 条库记录 <b id="svSrcNote" style="color:#F5C542"></b><span id="svBuild" style="opacity:.5;font-size:11px"> 构建 2026-10-24 16:02</span>　·　
+    样本 <b id="fPlayers">—</b> 位参与者 / <b id="fGames">—</b> 款游戏 / <b id="fRecs">—</b> 条库记录 <b id="svSrcNote" style="color:#F5C542"></b><span id="svBuild" style="opacity:.5;font-size:11px"> 构建 2026-10-24 16:29</span>　·　
     封面图：Steam 官方 CDN（已内嵌，离线可用）<br>
     所有参与者昵称均已脱敏为「参与者N」，不展示任何个人信息　·　
     指标 RAI 烂尾指数 · HV 心碎值　·　生成时间 <span id="genTime"></span>
@@ -795,7 +795,7 @@ select.form-select:focus{border-color:var(--cyan);box-shadow:0 0 0 .12rem rgba(9
   </div>
 </div>
 
-<script>console.log("%cBACKLOG 构建 2026-10-24 16:02","color:#5EC8F5");</script>
+<script>console.log("%cBACKLOG 构建 2026-10-24 16:29","color:#5EC8F5");</script>
 <script>
 /* ============================================================
    指标计算引擎（浏览器端）
@@ -5796,8 +5796,10 @@ setTimeout(function(){ try{ SVRefreshAcctSelect(); }catch(e){} }, 3600);
   'use strict';
 
   var PROXY_LS = 'sv_online_proxy_v1';
-  /* 部署 Cloudflare Worker 后，把地址填到这里（也可以由用户在界面上填） */
-  var DEFAULT_PROXY = '';
+  /* 已部署的 Cloudflare Worker 地址。写在这里 = 任何人打开页面都能直接用，
+     不用自己去填「代理设置」。只放行本项目的域名（见 worker.js 的 ALLOWED_ORIGINS）。 */
+  var DEFAULT_PROXY =
+    'https://steam-library-viz.3090252891.workers.dev';
 
   var state = { running: false, aborter: null, done: 0, total: 0, okDetail: 0, okTag: 0 };
 
